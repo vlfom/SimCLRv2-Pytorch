@@ -10,7 +10,7 @@ from resnet import get_resnet, name_to_params
 parser = argparse.ArgumentParser(description='SimCLR converter')
 parser.add_argument('tf_path', type=str, help='path of the input tensorflow file (ex: model.ckpt-250228)')
 parser.add_argument('--ema', action='store_true')
-parser.add_argument('--supervised', action='store_true')
+parser.add_argument('--supervised', type=bool, default=False)
 args = parser.parse_args()
 
 
@@ -58,7 +58,7 @@ def main():
     arg_idx = np.argsort(bn_idx)
     bn_keys = [bn_keys[idx] for idx in arg_idx]
 
-    depth, width, sk_ratio = name_to_params(args.tf_path)
+    depth, width, sk_ratio = 18, 1, 0
     model, head = get_resnet(depth, width, sk_ratio)
 
     conv_op = []
@@ -68,7 +68,8 @@ def main():
             conv_op.append(m)
         elif isinstance(m, nn.BatchNorm2d):
             bn_op.append(m)
-    assert len(vars_list) == (len(conv_op) + len(bn_op) * 4 + 2)  # 2 for fc
+    
+#     assert len(vars_list) == (len(conv_op) + len(bn_op) * 4 + 2)  # 2 for fc
 
     for i_conv in range(len(conv_keys)):
         m = conv_op[i_conv]
@@ -84,13 +85,14 @@ def main():
         m.bias.data = torch.from_numpy(sd[prefix + bn_keys[i_bn] + '/beta'])
         m.running_mean = torch.from_numpy(sd[prefix + bn_keys[i_bn] + '/moving_mean'])
         m.running_var = torch.from_numpy(sd[prefix + bn_keys[i_bn] + '/moving_variance'])
-
-    w = torch.from_numpy(sd['head_supervised/linear_layer/dense/kernel']).t()
-    assert model.fc.weight.shape == w.shape
-    model.fc.weight.data = w
-    b = torch.from_numpy(sd['head_supervised/linear_layer/dense/bias'])
-    assert model.fc.bias.shape == b.shape
-    model.fc.bias.data = b
+        
+    if args.supervised:
+        w = torch.from_numpy(sd['head_supervised/linear_layer/dense/kernel']).t()
+        assert model.fc.weight.shape == w.shape
+        model.fc.weight.data = w
+        b = torch.from_numpy(sd['head_supervised/linear_layer/dense/bias'])
+        assert model.fc.bias.shape == b.shape
+        model.fc.bias.data = b
 
     if args.supervised:
         save_location = f'r{depth}_{width}x_sk{1 if sk_ratio != 0 else 0}{"_ema" if use_ema_model else ""}.pth'

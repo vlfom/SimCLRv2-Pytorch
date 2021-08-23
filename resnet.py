@@ -54,20 +54,27 @@ class Projection(nn.Module):
 class BottleneckBlock(nn.Module):
     expansion = 4
 
-    def __init__(self, in_channels, out_channels, stride, sk_ratio=0, use_projection=False):
+    def __init__(self, in_channels, out_channels, stride, sk_ratio=0, use_projection=False, basic=False):
         super().__init__()
-        if use_projection:
+        if use_projection and not basic:
             self.projection = Projection(in_channels, out_channels * 4, stride, sk_ratio)
+        elif use_projection and basic:
+            self.projection = Projection(in_channels, out_channels, stride, sk_ratio)
         else:
             self.projection = nn.Identity()
-        ops = [conv(in_channels, out_channels, kernel_size=1), BatchNormRelu(out_channels)]
-        if sk_ratio > 0:
-            ops.append(SelectiveKernel(out_channels, out_channels, stride, sk_ratio))
+        if not basic:
+            ops = [conv(in_channels, out_channels, kernel_size=1), BatchNormRelu(out_channels)]
+            if sk_ratio > 0:
+                ops.append(SelectiveKernel(out_channels, out_channels, stride, sk_ratio))
+            else:
+                ops.append(conv(out_channels, out_channels, stride=stride))
+                ops.append(BatchNormRelu(out_channels))
+            ops.append(conv(out_channels, out_channels * 4, kernel_size=1))
+            ops.append(BatchNormRelu(out_channels * 4, relu=False))
         else:
-            ops.append(conv(out_channels, out_channels, stride=stride))
-            ops.append(BatchNormRelu(out_channels))
-        ops.append(conv(out_channels, out_channels * 4, kernel_size=1))
-        ops.append(BatchNormRelu(out_channels * 4, relu=False))
+            ops = [conv(in_channels, out_channels, stride=stride, kernel_size=3), BatchNormRelu(out_channels)]
+            ops.append(conv(out_channels, out_channels, kernel_size=3))
+            ops.append(BatchNormRelu(out_channels, relu=False))
         self.net = nn.Sequential(*ops)
 
     def forward(self, x):
@@ -76,12 +83,15 @@ class BottleneckBlock(nn.Module):
 
 
 class Blocks(nn.Module):
-    def __init__(self, num_blocks, in_channels, out_channels, stride, sk_ratio=0):
+    def __init__(self, num_blocks, in_channels, out_channels, stride, sk_ratio=0, basic=False):
         super().__init__()
-        self.blocks = nn.ModuleList([BottleneckBlock(in_channels, out_channels, stride, sk_ratio, True)])
-        self.channels_out = out_channels * BottleneckBlock.expansion
+        self.blocks = nn.ModuleList([BottleneckBlock(in_channels, out_channels, stride, sk_ratio, True, basic=basic)])
+        if not basic:
+            self.channels_out = out_channels * BottleneckBlock.expansion
+        else:
+            self.channels_out = out_channels
         for _ in range(num_blocks - 1):
-            self.blocks.append(BottleneckBlock(self.channels_out, out_channels, 1, sk_ratio))
+            self.blocks.append(BottleneckBlock(self.channels_out, out_channels, 1, sk_ratio, basic=basic))
 
     def forward(self, x):
         for b in self.blocks:
@@ -90,7 +100,7 @@ class Blocks(nn.Module):
 
 
 class Stem(nn.Sequential):
-    def __init__(self, sk_ratio, width_multiplier):
+    def __init__(self, sk_ratio, width_multiplier, basic):
         ops = []
         channels = 64 * width_multiplier // 2
         if sk_ratio > 0:
@@ -100,24 +110,28 @@ class Stem(nn.Sequential):
             ops.append(BatchNormRelu(channels))
             ops.append(conv(channels, channels * 2))
         else:
-            ops.append(conv(3, channels * 2, kernel_size=7, stride=2))
+            if not basic:
+                ops.append(conv(3, channels * 2, kernel_size=7, stride=2))
+            else:
+                ops.append(conv(3, channels * 2, kernel_size=3, stride=1))
         ops.append(BatchNormRelu(channels * 2))
-        ops.append(nn.MaxPool2d(kernel_size=3, stride=2, padding=1))
+        if not basic:
+            ops.append(nn.MaxPool2d(kernel_size=3, stride=2, padding=1))
         super().__init__(*ops)
 
 
 class ResNet(nn.Module):
-    def __init__(self, layers, width_multiplier, sk_ratio):
+    def __init__(self, layers, width_multiplier, sk_ratio, basic=False):
         super().__init__()
-        ops = [Stem(sk_ratio, width_multiplier)]
+        ops = [Stem(sk_ratio, width_multiplier, basic)]
         channels_in = 64 * width_multiplier
-        ops.append(Blocks(layers[0], channels_in, 64 * width_multiplier, 1, sk_ratio))
+        ops.append(Blocks(layers[0], channels_in, 64 * width_multiplier, 1, sk_ratio, basic=basic))
         channels_in = ops[-1].channels_out
-        ops.append(Blocks(layers[1], channels_in, 128 * width_multiplier, 2, sk_ratio))
+        ops.append(Blocks(layers[1], channels_in, 128 * width_multiplier, 2, sk_ratio, basic=basic))
         channels_in = ops[-1].channels_out
-        ops.append(Blocks(layers[2], channels_in, 256 * width_multiplier, 2, sk_ratio))
+        ops.append(Blocks(layers[2], channels_in, 256 * width_multiplier, 2, sk_ratio, basic=basic))
         channels_in = ops[-1].channels_out
-        ops.append(Blocks(layers[3], channels_in, 512 * width_multiplier, 2, sk_ratio))
+        ops.append(Blocks(layers[3], channels_in, 512 * width_multiplier, 2, sk_ratio, basic=basic))
         channels_in = ops[-1].channels_out
         self.channels_out = channels_in
         self.net = nn.Sequential(*ops)
@@ -154,14 +168,20 @@ class ContrastiveHead(nn.Module):
 
 
 def get_resnet(depth=50, width_multiplier=1, sk_ratio=0):  # sk_ratio=0.0625 is recommended
-    layers = {50: [3, 4, 6, 3], 101: [3, 4, 23, 3], 152: [3, 8, 36, 3], 200: [3, 24, 36, 3]}[depth]
-    resnet = ResNet(layers, width_multiplier, sk_ratio)
+    layers = {18: [2, 2, 2, 2], 50: [3, 4, 6, 3], 101: [3, 4, 23, 3], 152: [3, 8, 36, 3], 200: [3, 24, 36, 3]}[depth]
+    if depth == 18:
+        resnet = ResNet(layers, width_multiplier, sk_ratio, basic=True)
+    else:
+        resnet = ResNet(layers, width_multiplier, sk_ratio)
     return resnet, ContrastiveHead(resnet.channels_out)
 
 
 def name_to_params(checkpoint):
     sk_ratio = 0.0625 if '_sk1' in checkpoint else 0
-    if 'r50_' in checkpoint:
+
+    if 'r18_' in checkpoint:
+        depth = 18
+    elif 'r50_' in checkpoint:
         depth = 50
     elif 'r101_' in checkpoint:
         depth = 101
